@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -9,14 +11,26 @@ class GPT2Embeddings(nn.Module):
         self.pos_emb = nn.Embedding(max_position, hidden_size)
         self.max_position = max_position
 
-    def forward(self, input_ids: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_offset: int = 0,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         seq_len = input_ids.size(1)
-        end_position = position_offset + seq_len
-        if end_position > self.max_position:
-            raise ValueError(
-                f"Sequence length {end_position} exceeds max position {self.max_position}"
-            )
-        positions = torch.arange(
-            position_offset, end_position, device=input_ids.device
-        ).unsqueeze(0)
-        return self.token_emb(input_ids) + self.pos_emb(positions)
+        if position_ids is None:
+            end_position = position_offset + seq_len
+            if end_position > self.max_position:
+                raise ValueError(
+                    f"Sequence length {end_position} exceeds max position {self.max_position}"
+                )
+            position_ids = torch.arange(
+                position_offset, end_position, device=input_ids.device
+            ).unsqueeze(0).expand(input_ids.size(0), -1)
+        else:
+            if position_ids.max().item() >= self.max_position:
+                raise ValueError(
+                    f"Position id exceeds max position {self.max_position}"
+                )
+
+        return self.token_emb(input_ids) + self.pos_emb(position_ids)

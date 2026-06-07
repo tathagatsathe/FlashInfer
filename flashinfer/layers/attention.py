@@ -9,6 +9,20 @@ if TYPE_CHECKING:
     from flashinfer.cache.kv_cache import KVCache
 
 
+def _combine_masks(
+    causal_mask: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    seq_len: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    mask = causal_mask[:, :, :seq_len, :seq_len]
+    if attention_mask is not None:
+        pad = attention_mask.unsqueeze(1).unsqueeze(2) * attention_mask.unsqueeze(1).unsqueeze(3)
+        mask = mask * pad
+    min_value = torch.finfo(dtype).min
+    return torch.where(mask == 0, min_value, torch.zeros_like(mask))
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, max_position: int = 1024):
         super().__init__()
@@ -31,6 +45,7 @@ class CausalSelfAttention(nn.Module):
         x: torch.Tensor,
         kv_cache: Optional["KVCache"] = None,
         layer_idx: int = 0,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch, seq_len, hidden = x.shape
 
@@ -45,16 +60,18 @@ class CausalSelfAttention(nn.Module):
 
         if kv_cache is None:
             attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-            mask = self.causal_mask[:, :, :seq_len, :seq_len]
-            min_value = torch.finfo(attn_weights.dtype).min
-            attn_weights = attn_weights.masked_fill(mask == 0, min_value)
+            combined = _combine_masks(
+                self.causal_mask, attention_mask, seq_len, attn_weights.dtype
+            )
+            attn_weights = attn_weights + combined
             attn_weights = F.softmax(attn_weights, dim=-1)
             attn_output = torch.matmul(attn_weights, v)
         elif seq_len > 1:
             attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
-            mask = self.causal_mask[:, :, :seq_len, :seq_len]
-            min_value = torch.finfo(attn_weights.dtype).min
-            attn_weights = attn_weights.masked_fill(mask == 0, min_value)
+            combined = _combine_masks(
+                self.causal_mask, attention_mask, seq_len, attn_weights.dtype
+            )
+            attn_weights = attn_weights + combined
             attn_weights = F.softmax(attn_weights, dim=-1)
             attn_output = torch.matmul(attn_weights, v)
             kv_cache.append(layer_idx, k, v)

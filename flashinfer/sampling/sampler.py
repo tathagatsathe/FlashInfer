@@ -35,3 +35,28 @@ def sample_next_token(
 
     probs = torch.softmax(logits, dim=-1)
     return int(torch.multinomial(probs, num_samples=1).item())
+
+
+def sample_next_token_batch(
+    logits: torch.Tensor,
+    temperature: float = 1.0,
+    top_k: Optional[int] = None,
+    top_p: Optional[float] = None,
+    finished: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Sample next token for each row in a batch of logits (batch, vocab)."""
+    batch_size = logits.size(0)
+    tokens = []
+    for i in range(batch_size):
+        if finished is not None and finished[i]:
+            tokens.append(0)
+            continue
+        tokens.append(
+            sample_next_token(
+                logits[i],
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+        )
+    return torch.tensor(tokens, dtype=torch.long, device=logits.device)

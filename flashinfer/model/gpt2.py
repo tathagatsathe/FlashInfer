@@ -39,11 +39,15 @@ class GPT2Block(nn.Module):
         x: torch.Tensor,
         kv_cache: Optional[KVCache] = None,
         layer_idx: int = 0,
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if kv_cache is None:
-            x = x + self.attn(self.ln_1(x))
-        else:
-            x = x + self.attn(self.ln_1(x), kv_cache=kv_cache, layer_idx=layer_idx)
+        attn_out = self.attn(
+            self.ln_1(x),
+            kv_cache=kv_cache,
+            layer_idx=layer_idx,
+            attention_mask=attention_mask,
+        )
+        x = x + attn_out
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -66,18 +70,37 @@ class GPT2Model(nn.Module):
         x = self.ln_f(x)
         return self.lm_head(x)
 
-    def forward_prefill(self, input_ids: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
-        x = self.embeddings(input_ids, position_offset=0)
+    def forward_prefill(
+        self,
+        input_ids: torch.Tensor,
+        kv_cache: KVCache,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = self.embeddings(input_ids, position_ids=position_ids)
         seq_len = input_ids.size(1)
         for i, block in enumerate(self.blocks):
-            x = block(x, kv_cache=kv_cache, layer_idx=i)
+            x = block(
+                x,
+                kv_cache=kv_cache,
+                layer_idx=i,
+                attention_mask=attention_mask,
+            )
         kv_cache.advance(seq_len)
         x = self.ln_f(x)
         return self.lm_head(x)
 
-    def forward_decode(self, input_ids: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
-        position_offset = kv_cache.seq_len
-        x = self.embeddings(input_ids, position_offset=position_offset)
+    def forward_decode(
+        self,
+        input_ids: torch.Tensor,
+        kv_cache: KVCache,
+        position_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if position_ids is None:
+            position_offset = kv_cache.seq_len
+            x = self.embeddings(input_ids, position_offset=position_offset)
+        else:
+            x = self.embeddings(input_ids, position_ids=position_ids)
         for i, block in enumerate(self.blocks):
             x = block(x, kv_cache=kv_cache, layer_idx=i)
         kv_cache.advance(input_ids.size(1))
