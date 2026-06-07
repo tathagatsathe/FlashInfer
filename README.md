@@ -38,6 +38,8 @@ python examples/generate.py --prompt "Hello, world" --max-new-tokens 50 --temper
 
 ## Project Structure
 
+See [docs/architecture.md](docs/architecture.md) for dataflow diagrams and a full system overview.
+
 ```
 flashinfer/
 ├── cache/        # KV cache for incremental decode
