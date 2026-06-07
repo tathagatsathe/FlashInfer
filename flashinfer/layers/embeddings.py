@@ -9,11 +9,14 @@ class GPT2Embeddings(nn.Module):
         self.pos_emb = nn.Embedding(max_position, hidden_size)
         self.max_position = max_position
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
         seq_len = input_ids.size(1)
-        if seq_len > self.max_position:
+        end_position = position_offset + seq_len
+        if end_position > self.max_position:
             raise ValueError(
-                f"Sequence length {seq_len} exceeds max position {self.max_position}"
+                f"Sequence length {end_position} exceeds max position {self.max_position}"
             )
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+        positions = torch.arange(
+            position_offset, end_position, device=input_ids.device
+        ).unsqueeze(0)
         return self.token_emb(input_ids) + self.pos_emb(positions)

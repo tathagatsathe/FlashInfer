@@ -1,8 +1,12 @@
 import math
+from typing import Optional, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from flashinfer.cache.kv_cache import KVCache
 
 
 class CausalSelfAttention(nn.Module):
@@ -22,7 +26,12 @@ class CausalSelfAttention(nn.Module):
             persistent=False,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: Optional["KVCache"] = None,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
         batch, seq_len, hidden = x.shape
 
         qkv = self.qkv(x)
@@ -33,14 +42,29 @@ class CausalSelfAttention(nn.Module):
         v = v.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-        mask = self.causal_mask[:, :, :seq_len, :seq_len]
-        min_value = torch.finfo(attn_weights.dtype).min
-        attn_weights = attn_weights.masked_fill(mask == 0, min_value)
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        if kv_cache is None:
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+            mask = self.causal_mask[:, :, :seq_len, :seq_len]
+            min_value = torch.finfo(attn_weights.dtype).min
+            attn_weights = attn_weights.masked_fill(mask == 0, min_value)
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+        elif seq_len > 1:
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+            mask = self.causal_mask[:, :, :seq_len, :seq_len]
+            min_value = torch.finfo(attn_weights.dtype).min
+            attn_weights = attn_weights.masked_fill(mask == 0, min_value)
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+            kv_cache.append(layer_idx, k, v)
+        else:
+            cache_end = kv_cache.append(layer_idx, k, v)
+            cached_k, cached_v = kv_cache.get(layer_idx, end=cache_end)
+            attn_weights = torch.matmul(q, cached_k.transpose(-2, -1)) * scale
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_output = torch.matmul(attn_weights, cached_v)
 
-        attn_output = torch.matmul(attn_weights, v)
         attn_output = (
             attn_output.transpose(1, 2).contiguous().view(batch, seq_len, hidden)
         )

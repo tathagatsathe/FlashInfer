@@ -4,6 +4,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from flashinfer.cache.kv_cache import KVCache
 from flashinfer.layers.attention import CausalSelfAttention
 from flashinfer.layers.embeddings import GPT2Embeddings
 from flashinfer.layers.mlp import GPT2MLP
@@ -33,8 +34,16 @@ class GPT2Block(nn.Module):
         self.ln_2 = LayerNorm(hidden)
         self.mlp = GPT2MLP(hidden, config.intermediate_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache: Optional[KVCache] = None,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        if kv_cache is None:
+            x = x + self.attn(self.ln_1(x))
+        else:
+            x = x + self.attn(self.ln_1(x), kv_cache=kv_cache, layer_idx=layer_idx)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -54,6 +63,24 @@ class GPT2Model(nn.Module):
         x = self.embeddings(input_ids)
         for block in self.blocks:
             x = block(x)
+        x = self.ln_f(x)
+        return self.lm_head(x)
+
+    def forward_prefill(self, input_ids: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
+        x = self.embeddings(input_ids, position_offset=0)
+        seq_len = input_ids.size(1)
+        for i, block in enumerate(self.blocks):
+            x = block(x, kv_cache=kv_cache, layer_idx=i)
+        kv_cache.advance(seq_len)
+        x = self.ln_f(x)
+        return self.lm_head(x)
+
+    def forward_decode(self, input_ids: torch.Tensor, kv_cache: KVCache) -> torch.Tensor:
+        position_offset = kv_cache.seq_len
+        x = self.embeddings(input_ids, position_offset=position_offset)
+        for i, block in enumerate(self.blocks):
+            x = block(x, kv_cache=kv_cache, layer_idx=i)
+        kv_cache.advance(input_ids.size(1))
         x = self.ln_f(x)
         return self.lm_head(x)
 
