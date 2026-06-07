@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 import torch
 from transformers import AutoTokenizer
@@ -43,20 +43,20 @@ class InferenceEngine:
             dtype=next(self.model.parameters()).dtype,
         )
 
-    @torch.no_grad()
-    def generate(
+    @torch.inference_mode()
+    def generate_stream(
         self,
         prompt: str,
         max_new_tokens: int = 20,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
-    ) -> str:
+    ) -> Iterator[str]:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
         generated = input_ids.tolist()[0]
         eos_token_id = self.tokenizer.eos_token_id
 
-        kv_cache = self._make_kv_cache(batch=input_ids.size(0))
+        kv_cache = self._make_kv_cache(batch=1)
         logits = self.model.forward_prefill(input_ids, kv_cache)
         next_logits = logits[0, -1, :]
 
@@ -68,6 +68,7 @@ class InferenceEngine:
                 top_p=top_p,
             )
             generated.append(next_token)
+            yield self.tokenizer.decode([next_token], skip_special_tokens=True)
             if eos_token_id is not None and next_token == eos_token_id:
                 break
 
@@ -75,9 +76,28 @@ class InferenceEngine:
             logits = self.model.forward_decode(token, kv_cache)
             next_logits = logits[0, -1, :]
 
-        return self.tokenizer.decode(generated, skip_special_tokens=True)
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 20,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+    ) -> str:
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
+        prefix = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        return prefix + "".join(
+            self.generate_stream(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+        )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate_batch(
         self,
         prompts: List[str],
