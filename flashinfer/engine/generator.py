@@ -1,12 +1,17 @@
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Union
 
 import torch
 from transformers import AutoTokenizer
 
 from flashinfer.cache.kv_cache import KVCache
-from flashinfer.engine.batching import left_pad_sequences
+from flashinfer.engine.batching import BatchInput, left_pad_sequences
+from flashinfer.engine.generation_config import GenerationConfig
 from flashinfer.model.gpt2 import GPT2Model
-from flashinfer.sampling.sampler import sample_next_token, sample_next_token_batch
+from flashinfer.sampling.sampler import (
+    apply_repetition_penalty,
+    sample_next_token,
+    sample_next_token_batch,
+)
 from flashinfer.weights.loader import config_from_hf, load_hf_weights
 
 
@@ -16,20 +21,29 @@ class InferenceEngine:
         model: GPT2Model,
         tokenizer: AutoTokenizer,
         device: str = "cpu",
+        dtype: torch.dtype = torch.float32,
     ):
-        self.model = model.to(device).eval()
+        self.model = model.to(device=device, dtype=dtype).eval()
         self.tokenizer = tokenizer
         self.device = device
+        self.dtype = dtype
 
     @classmethod
-    def from_pretrained(cls, model_name: str, device: str = "cpu") -> "InferenceEngine":
+    def from_pretrained(
+        cls,
+        model_name: str,
+        device: str = "cpu",
+        dtype: Union[str, torch.dtype] = "float32",
+    ) -> "InferenceEngine":
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype)
         config = config_from_hf(model_name)
         model = GPT2Model.from_config(config)
-        load_hf_weights(model, model_name)
+        load_hf_weights(model, model_name, dtype=dtype)
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
-        return cls(model, tokenizer, device)
+        return cls(model, tokenizer, device, dtype)
 
     def _make_kv_cache(self, batch: int = 1) -> KVCache:
         config = self.model.config
@@ -40,35 +54,74 @@ class InferenceEngine:
             head_dim=config.n_embd // config.n_head,
             max_len=config.n_positions,
             device=torch.device(self.device),
-            dtype=next(self.model.parameters()).dtype,
+            dtype=self.dtype,
         )
+
+    def _make_generator(self, seed: Optional[int]) -> Optional[torch.Generator]:
+        if seed is None:
+            return None
+        gen = torch.Generator(device=self.device)
+        gen.manual_seed(seed)
+        return gen
+
+    def _check_context_len(self, seq_len: int, max_context_len: Optional[int]) -> None:
+        if max_context_len is not None and seq_len >= max_context_len:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds max_context_len {max_context_len}"
+            )
+        if seq_len >= self.model.config.n_positions:
+            raise ValueError(
+                f"Sequence length {seq_len} exceeds model max positions "
+                f"{self.model.config.n_positions}"
+            )
+
+    def _should_stop(
+        self,
+        text: str,
+        stop_sequences: Optional[List[str]],
+    ) -> bool:
+        if not stop_sequences:
+            return False
+        return any(text.endswith(stop) for stop in stop_sequences)
 
     @torch.inference_mode()
     def generate_stream(
         self,
         prompt: str,
-        max_new_tokens: int = 20,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
+        config: Optional[GenerationConfig] = None,
+        **kwargs,
     ) -> Iterator[str]:
+        cfg = config or GenerationConfig(**kwargs)
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
         generated = input_ids.tolist()[0]
+        self._check_context_len(len(generated), cfg.max_context_len)
         eos_token_id = self.tokenizer.eos_token_id
+        rng = self._make_generator(cfg.seed)
 
         kv_cache = self._make_kv_cache(batch=1)
         logits = self.model.forward_prefill(input_ids, kv_cache)
         next_logits = logits[0, -1, :]
 
-        for _ in range(max_new_tokens):
+        for _ in range(cfg.max_new_tokens):
+            self._check_context_len(len(generated), cfg.max_context_len)
+            next_logits = apply_repetition_penalty(
+                next_logits, generated, cfg.repetition_penalty
+            )
             next_token = sample_next_token(
                 next_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
+                temperature=cfg.temperature,
+                top_k=cfg.top_k,
+                top_p=cfg.top_p,
+                generator=rng,
             )
             generated.append(next_token)
-            yield self.tokenizer.decode([next_token], skip_special_tokens=True)
+
+            piece = self.tokenizer.decode([next_token], skip_special_tokens=True)
+            yield piece
+
+            full_text = self.tokenizer.decode(generated, skip_special_tokens=True)
+            if self._should_stop(full_text, cfg.stop_sequences):
+                break
             if eos_token_id is not None and next_token == eos_token_id:
                 break
 
@@ -80,32 +133,23 @@ class InferenceEngine:
     def generate(
         self,
         prompt: str,
-        max_new_tokens: int = 20,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
+        config: Optional[GenerationConfig] = None,
+        **kwargs,
     ) -> str:
+        cfg = config or GenerationConfig(**kwargs)
+        chunks = list(self.generate_stream(prompt, config=cfg))
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
         prefix = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-        return prefix + "".join(
-            self.generate_stream(
-                prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            )
-        )
+        return prefix + "".join(chunks)
 
     @torch.inference_mode()
     def generate_batch(
         self,
         prompts: List[str],
-        max_new_tokens: int = 20,
-        temperature: float = 1.0,
-        top_k: Optional[int] = None,
-        top_p: Optional[float] = None,
+        config: Optional[GenerationConfig] = None,
+        **kwargs,
     ) -> List[str]:
+        cfg = config or GenerationConfig(**kwargs)
         if not prompts:
             return []
 
@@ -118,6 +162,7 @@ class InferenceEngine:
         batch_size = len(prompts)
         generated: List[List[int]] = [seq.copy() for seq in sequences]
         eos_token_id = self.tokenizer.eos_token_id
+        rng = self._make_generator(cfg.seed)
         finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
 
         kv_cache = self._make_kv_cache(batch=batch_size)
@@ -129,17 +174,30 @@ class InferenceEngine:
         )
 
         padded_len = batch.input_ids.size(1)
-        next_logits = logits[torch.arange(batch_size), padded_len - 1, :]
+        position_offset = padded_len - 1
+        next_logits = logits[torch.arange(batch_size), position_offset, :]
 
-        for _ in range(max_new_tokens):
+        for _ in range(cfg.max_new_tokens):
             if finished.all():
                 break
 
+            for i in range(batch_size):
+                if not finished[i]:
+                    self._check_context_len(len(generated[i]), cfg.max_context_len)
+
+            for i in range(batch_size):
+                if finished[i]:
+                    continue
+                next_logits[i] = apply_repetition_penalty(
+                    next_logits[i], generated[i], cfg.repetition_penalty
+                )
+
             next_tokens = sample_next_token_batch(
                 next_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
+                temperature=cfg.temperature,
+                top_k=cfg.top_k,
+                top_p=cfg.top_p,
+                generator=rng,
                 finished=finished,
             )
 
@@ -148,7 +206,10 @@ class InferenceEngine:
                     continue
                 token = int(next_tokens[i].item())
                 generated[i].append(token)
-                if eos_token_id is not None and token == eos_token_id:
+                text = self.tokenizer.decode(generated[i], skip_special_tokens=True)
+                if self._should_stop(text, cfg.stop_sequences):
+                    finished[i] = True
+                elif eos_token_id is not None and token == eos_token_id:
                     finished[i] = True
 
             if finished.all():

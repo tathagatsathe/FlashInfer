@@ -1,6 +1,23 @@
-from typing import Optional
+from typing import Iterable, List, Optional, Set, Union
 
 import torch
+
+
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    generated_ids: Iterable[int],
+    penalty: float,
+) -> torch.Tensor:
+    if penalty == 1.0:
+        return logits
+    logits = logits.clone()
+    unique_ids: Set[int] = set(generated_ids)
+    for token_id in unique_ids:
+        if logits[token_id] > 0:
+            logits[token_id] = logits[token_id] / penalty
+        else:
+            logits[token_id] = logits[token_id] * penalty
+    return logits
 
 
 def sample_next_token(
@@ -8,6 +25,7 @@ def sample_next_token(
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
+    generator: Optional[torch.Generator] = None,
 ) -> int:
     """Sample the next token from last-position logits."""
     if temperature <= 0.0:
@@ -34,7 +52,7 @@ def sample_next_token(
         logits[indices_to_remove] = float("-inf")
 
     probs = torch.softmax(logits, dim=-1)
-    return int(torch.multinomial(probs, num_samples=1).item())
+    return int(torch.multinomial(probs, num_samples=1, generator=generator).item())
 
 
 def sample_next_token_batch(
@@ -42,6 +60,7 @@ def sample_next_token_batch(
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     top_p: Optional[float] = None,
+    generator: Optional[torch.Generator] = None,
     finished: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Sample next token for each row in a batch of logits (batch, vocab)."""
@@ -57,6 +76,7 @@ def sample_next_token_batch(
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
+                generator=generator,
             )
         )
     return torch.tensor(tokens, dtype=torch.long, device=logits.device)
